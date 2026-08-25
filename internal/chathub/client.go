@@ -29,15 +29,115 @@ var ErrRateLimitNotice = errors.New("upstream rate-limit notice")
 
 var ErrEmptyCompletion = errors.New("upstream returned empty completion; tone may be unavailable for this tenant")
 
+var ErrImageLimit = errors.New("upstream image generation daily limit reached")
+
+var ErrOffensiveContent = errors.New("upstream content policy flagged as offensive")
+
+var contentPolicyPatterns = []string{
+	"很抱歉，我无法响应",
+	"我很抱歉，我无法响应",
+	"很抱歉，我无法",
+	"抱歉，我无法",
+	"i'm sorry, i can't respond",
+	"i'm sorry, i cannot respond",
+	"i apologize, i cannot",
+}
+
+func IsContentPolicyBlock(text string) bool {
+	if len(text) > 300 {
+		return false
+	}
+	low := strings.ToLower(text)
+	for _, p := range contentPolicyPatterns {
+		if strings.Contains(low, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
+}
+
 // DialError carries the HTTP status and optional Retry-After from a failed
 // WebSocket dial so the web layer can route it into the correct cooldown.
 type DialError struct {
 	Status     int
 	RetryAfter int
+	Kind       string
+	cause      error
 }
 
 func (e *DialError) Error() string {
+	if e.Kind != "" {
+		if e.cause != nil {
+			return fmt.Sprintf("ws dial: %s upstream %d: %v", e.Kind, e.Status, e.cause)
+		}
+		return fmt.Sprintf("ws dial: %s upstream %d", e.Kind, e.Status)
+	}
+	if e.cause != nil {
+		return fmt.Sprintf("ws dial: upstream %d: %v", e.Status, e.cause)
+	}
 	return fmt.Sprintf("ws dial: upstream %d", e.Status)
+}
+
+func (e *DialError) Unwrap() error { return e.cause }
+
+func classifyTransportError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "socks"):
+		return "SOCKS5"
+	case strings.Contains(msg, "no such host") || strings.Contains(msg, "no address associated") || strings.Contains(msg, "name resolution") || strings.Contains(msg, "dns"):
+		return "DNS"
+	case strings.Contains(msg, "tls") || strings.Contains(msg, "certificate") || strings.Contains(msg, "x509"):
+		return "TLS"
+	case strings.Contains(msg, "handshake"):
+		return "WS_HANDSHAKE"
+	case strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "timeout") && strings.Contains(msg, "read"):
+		return "WS_READ_TIMEOUT"
+	case strings.Contains(msg, "connection refused") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "network is unreachable") || strings.Contains(msg, "connection was forcibly closed"):
+		return "TCP"
+	default:
+		if strings.Contains(msg, "timeout") {
+			return "WS_READ_TIMEOUT"
+		}
+		return "TCP"
+	}
+}
+
+func wrapDialError(err error, status int, retryAfter int) *DialError {
+	kind := ""
+	if status == 0 && err != nil {
+		if errors.Is(err, context.Canceled) {
+			kind = "CLIENT_CANCELED"
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			kind = "WS_READ_TIMEOUT"
+		} else {
+			kind = classifyTransportError(err)
+		}
+	}
+	return &DialError{Status: status, RetryAfter: retryAfter, Kind: kind, cause: err}
+}
+
+// Phase is the 7-stage state machine for a ChatHub exchange.
+// Only PayloadSent is zero-side-effect and retriable; once streaming has
+// begun (any text, tool event or reused conversation) failover must not
+// switch accounts.
+type Phase int
+
+const (
+	PhaseInit Phase = iota
+	PhaseDial
+	PhaseHandshake
+	PhaseUpload
+	PhasePayloadSent
+	PhaseStreaming
+	PhaseCompleted
+)
+
+func IsRetriablePhase(p Phase) bool {
+	return p == PhasePayloadSent
 }
 
 var chTrace = os.Getenv("M365_TRACE") == "1"
@@ -70,7 +170,7 @@ const (
 )
 
 // Variants mirrored from the verified browser / Python probe.
-const variants = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix"
+const variants = "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,turnOffWorkTabUpsellFromClient,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,feature.cwcallowedos,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix,feature.EnableImageGenInsufficientTokensThrottled,feature.EnableImageGenSystemCapacityThrottled,feature.EnableConversationShareApis,feature.EnableConversationShareApisForMsa,feature.IsCitationsReferencesOutputEnabled,feature.enableDeltaStreamingForReferences,feature.enableIncludeReferencesInDeltaResponse,feature.enablereferencesforagents,feature.EnableMergingPureDeltas,feature.EnableRemoveStreamingMode"
 
 type Account struct {
 	AccessToken string
@@ -86,9 +186,38 @@ type Request struct {
 	Attachments    []Attachment
 	Tools          []Tool
 	ToolChoice     any
-	MCPServerURL   string // URL of the MCP HTTP SSE server for tool discovery
-	// Started is true only for the first turn of a ChatHub conversation.
-	Started bool
+	MCPServerURL   string
+	Started        bool
+	ConversationSignature   string
+	PreviousMessages        []ContextMessage
+	LicenseType             string
+	Scenario                string
+	ConnectedFederatedIDs   []string
+	FeatureFlags            FeatureFlags
+	DisableMemory           bool
+	Locale                  string
+	Market                  string
+	TimeZone                string
+	TimeZoneOffset          int
+	DeviceOS                string
+}
+
+type FeatureFlags struct {
+	MemoryV2            bool
+	DeepWork            bool
+	ComputerUse         bool
+	RealtimeVoice       bool
+	SystemPromptOverride bool
+	DesignerImageGen4o  bool
+	CodeCanvas          bool
+	SydneyReconnect     bool
+}
+
+type ContextMessage struct {
+	Author      string `json:"author"`
+	Description string `json:"description"`
+	ContextType string `json:"contextType"`
+	MessageType string `json:"messageType"`
 }
 
 // StreamEvent is the protocol-neutral event exposed while ChatHub is still
@@ -106,25 +235,67 @@ type StreamEvent struct {
 
 type StreamHandler func(StreamEvent) error
 
+type Timestamps struct {
+	RequestSent                string `json:"requestSent"`
+	FirstServiceResponseReceived string `json:"firstServiceResponseReceived,omitempty"`
+	FirstTokenReceived         string `json:"firstTokenReceived,omitempty"`
+	LastTokenReceived          string `json:"lastTokenReceived,omitempty"`
+}
+
 type Result struct {
-	Text           string
-	Reasoning      string
-	ConversationID string
-	SessionID      string
-	RequestID      string
-	Throttling     any
-	RawResult      string
-	Events         []json.RawMessage
-	Normalized     []Event
-	Images         []string
+	Text                      string
+	Reasoning                 string
+	ConversationID            string
+	SessionID                 string
+	RequestID                 string
+	Throttling                any
+	SuggestedResponses        []SuggestedResponse
+	RawResult                 string
+	Events                    []json.RawMessage
+	Normalized                []Event
+	Images                    []string
+	Offense                   string
+	Scores                    []Score
+	ConversationTransferToken string
+	MeteringInformation       any
+	SpokenText                string
+	StorageMessageID          string
+	References                map[string]Reference
+	Timestamps                Timestamps
+}
+
+type SuggestedResponse struct {
+	CommandText        string `json:"commandText"`
+	Text               string `json:"text"`
+	SuggestionCategory string `json:"suggestionCategory,omitempty"`
+	ContentOrigin      string `json:"contentOrigin,omitempty"`
+	HiddenText         string `json:"hiddenText,omitempty"`
+	MessageID          string `json:"messageId,omitempty"`
+	Author             string `json:"author,omitempty"`
+	CreatedAt          string `json:"createdAt,omitempty"`
+	MessageType        string `json:"messageType,omitempty"`
+	Offense            string `json:"offense,omitempty"`
+}
+
+type Score struct {
+	Component string  `json:"component"`
+	Score     float64 `json:"score"`
+}
+
+type Reference struct {
+	TargetLink          string `json:"targetLink"`
+	ProviderDisplayName string `json:"providerDisplayName,omitempty"`
+	Title               string `json:"title,omitempty"`
+	Snippet             string `json:"snippet,omitempty"`
+	LastUpdatedDate     string `json:"lastUpdatedDate,omitempty"`
 }
 
 type Client struct {
-	HTTPHeader  http.Header
-	HTTPClient  *http.Client
-	Dialer      *websocket.Dialer
-	Pool        *ConnPool
-	Trace       func(map[string]any)
+	HTTPHeader http.Header
+	HTTPClient *http.Client
+	Dialer     *websocket.Dialer
+	Pool       *ConnPool
+	Trace      func(map[string]any)
 }
 
 func NewClient() *Client {
@@ -200,10 +371,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		firstTurn = true
 	}
 	requestID := uuid.NewString()
-	wsURL, err := buildWSURL(acc, req.SessionID, req.ConversationID, requestID)
+	wsURL, err := BuildWSURLWithOptions(acc, req.SessionID, req.ConversationID, requestID, req.LicenseType, req.Scenario, req.DisableMemory)
 	if err != nil {
 		return Result{}, err
 	}
+	phase := PhaseInit
+	_ = phase
 	attachCh := make(chan error, 1)
 	if len(req.Attachments) > 0 {
 		go func() { attachCh <- c.uploadAttachments(ctx, acc, req.ConversationID, req.Attachments) }()
@@ -212,29 +385,64 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	dialStarted := time.Now()
 	var conn *websocket.Conn
 	var reused bool
+	phase = PhaseDial
+
 	if c.Pool != nil {
 		var poolErr error
 		conn, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL)
 		if poolErr != nil {
-			return Result{}, fmt.Errorf("ws dial: %w", poolErr)
+			if errors.Is(poolErr, context.Canceled) {
+				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: poolErr}
+			}
+			return Result{}, wrapDialError(poolErr, 0, 0)
+		}
+		if reused {
+			go func() {
+				warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				warmReqID := uuid.NewString()
+				warmSID := uuid.NewString()
+				warmCID := uuid.NewString()
+				warmURL, _ := BuildWSURL(acc, warmSID, warmCID, warmReqID, req.LicenseType, req.Scenario)
+				c.Pool.Warm(warmCtx, acc, warmURL)
+			}()
 		}
 	}
 	if conn == nil {
 		var resp *http.Response
 		conn, resp, err = c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
 		if err != nil {
-			if resp != nil && (resp.StatusCode == 429 || resp.StatusCode == 401 || resp.StatusCode == 403) {
+			if resp != nil && (resp.StatusCode == 429 || resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 503) {
 				retryAfter := 0
 				if v, _ := strconv.Atoi(resp.Header.Get("Retry-After")); v > 0 {
 					retryAfter = v
 				}
 				log.Printf("chathub ws_dial %d Retry-After=%d", resp.StatusCode, retryAfter)
-				return Result{}, &DialError{Status: resp.StatusCode, RetryAfter: retryAfter}
+				kind := ""
+				switch resp.StatusCode {
+				case 429:
+					kind = "QUOTA_429"
+				case 503:
+					kind = "OVERLOAD_503"
+				case 401:
+					kind = "AUTH_EXPIRED_401"
+				case 403:
+					kind = "FORBIDDEN_403"
+				}
+				return Result{}, &DialError{Status: resp.StatusCode, RetryAfter: retryAfter, Kind: kind, cause: err}
 			}
-			return Result{}, fmt.Errorf("ws dial: %w", err)
+			if errors.Is(err, context.Canceled) {
+				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
+			}
+			return Result{}, wrapDialError(err, 0, 0)
 		}
 	}
-	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d reused=%t", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds(), reused)
+	if reused {
+		log.Printf("chathub timing ws_dial_ms=0 total_ms=%d reused=true (pooled)", time.Since(startedAt).Milliseconds())
+	} else {
+		log.Printf("chathub timing ws_dial_ms=%d total_ms=%d reused=false", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds())
+	}
+	phase = PhaseHandshake
 
 	var writeMu sync.Mutex
 	wsWrite := func(msgType int, data []byte) error {
@@ -243,7 +451,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		return conn.WriteMessage(msgType, data)
 	}
 
-	returnConn := true
+	returnConn := false
 	defer func() {
 		if returnConn && conn != nil && c.Pool != nil {
 			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -254,6 +462,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		}
 	}()
 
+	phase = PhaseUpload
 	if len(req.Attachments) > 0 {
 		if attachErr := <-attachCh; attachErr != nil {
 			returnConn = false
@@ -267,15 +476,25 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	if !reused {
 		if err := wsWrite(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
 			returnConn = false
-			return Result{}, fmt.Errorf("handshake send: %w", err)
+			if errors.Is(err, context.Canceled) {
+				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
+			}
+			return Result{}, &DialError{Status: 0, Kind: "WS_HANDSHAKE", cause: fmt.Errorf("handshake send: %w", err)}
 		}
 		if _, _, err := conn.ReadMessage(); err != nil {
 			returnConn = false
-			return Result{}, fmt.Errorf("handshake recv: %w", err)
+			if errors.Is(err, context.Canceled) {
+				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
+			}
+			kind := "WS_HANDSHAKE"
+			if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+				kind = "WS_HANDSHAKE"
+			}
+			return Result{}, &DialError{Status: 0, Kind: kind, cause: fmt.Errorf("handshake recv: %w", err)}
 		}
 	}
 
-	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.MCPServerURL)
+	payload := chatPayload(req, requestID, firstTurn)
 	log.Printf("chathub prompt-trace text=%d tools=%d payload=%d", len(req.Text), len(req.Tools), len(payload))
 	if c.Trace != nil {
 		meta := map[string]any{"stage": "chathub_payload", "attachment_count": len(req.Attachments), "payload_has_attachments": strings.Contains(payload, `"attachments"`), "attachments": []map[string]any{}}
@@ -286,10 +505,15 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 	log.Printf("chathub timing handshake_ms=%d", time.Since(dialStarted).Milliseconds())
 	payloadSentAt := time.Now()
+	ts := Timestamps{RequestSent: payloadSentAt.UTC().Format(time.RFC3339Nano)}
 	if err := wsWrite(websocket.TextMessage, []byte(payload)); err != nil {
 		returnConn = false
-		return Result{}, fmt.Errorf("chat send: %w", err)
+		if errors.Is(err, context.Canceled) {
+			return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: err}
+		}
+		return Result{}, &DialError{Status: 0, Kind: classifyTransportError(err), cause: fmt.Errorf("chat send: %w", err)}
 	}
+	phase = PhasePayloadSent
 
 	var deltas []string
 	var streamed strings.Builder
@@ -297,11 +521,16 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if d == "" {
 			return nil
 		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if chTrace {
 			log.Printf("[trace:emitDelta] len=%d streamed=%d preview=%q", len(d), streamed.Len()+len(d), truncate(d, 80))
 		}
 		if streamed.Len() == 0 {
 			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(d))
+			ts.FirstTokenReceived = time.Now().UTC().Format(time.RFC3339Nano)
+			phase = PhaseStreaming
 		}
 		streamed.WriteString(d)
 		deltas = append(deltas, d)
@@ -330,6 +559,25 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			strings.Contains(t, "too many requests") ||
 			strings.Contains(t, "please retry") && strings.Contains(t, "later")
 	}
+	imageLimitDetected := func(text string) bool {
+		if streamed.Len() != 0 {
+			return false
+		}
+		t := strings.ToLower(text)
+		return strings.Contains(t, "无法生成更多图像") || strings.Contains(t, "unable to generate more images") || strings.Contains(t, "cannot generate more images today")
+	}
+	contentPolicyDetected := func(text string) bool {
+		if streamed.Len() != 0 {
+			return false
+		}
+		return IsContentPolicyBlock(text)
+	}
+	// skippedSnapshots counts non-prefix rewrites dropped by emitSnapshot.
+	// Upstream interleaves per-token writeAtCursor fragments with cumulative
+	// snapshots, so bursts of skips are normal; the dropped text is
+	// reconciled against the authoritative final message on completion
+	// (see finalizeText). Logged once as a summary instead of per frame.
+	skippedSnapshots := 0
 	emitSnapshot := func(snapshot string) error {
 		if snapshot == "" {
 			return nil
@@ -337,8 +585,14 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if chTrace {
 			log.Printf("[trace:emitSnapshot] cur=%d snapshot=%d", streamed.Len(), len(snapshot))
 		}
+		if imageLimitDetected(snapshot) {
+			return ErrImageLimit
+		}
 		if rateLimited(snapshot) {
 			return ErrRateLimitNotice
+		}
+		if contentPolicyDetected(snapshot) {
+			return ErrOffensiveContent
 		}
 		cur := streamed.String()
 		if cur == "" {
@@ -350,27 +604,48 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if len(snapshot) <= len(cur) {
 			return nil
 		}
-		log.Printf("[emitSnapshot] skip: cur=%d snapshot=%d (non-prefix rewrite)", len(cur), len(snapshot))
+		skippedSnapshots++
+		if chTrace {
+			log.Printf("[trace:emitSnapshot] skip: cur=%d snapshot=%d (non-prefix rewrite)", len(cur), len(snapshot))
+		}
 		return nil
 	}
 	var final string
 	var throttling any
 	var rawResult string
 	var events []json.RawMessage
+	var suggestions []SuggestedResponse
 	seenStreamTools := map[string]bool{}
 	var reasoningBuf strings.Builder
+	var offense string
+	var scores []Score
+	var conversationTransferToken string
+	var meteringInformation any
+	var spokenText string
+	var storageMessageID string
+	references := make(map[string]Reference)
+	var firstServiceResponse bool
 
 	deadline := time.Now().Add(5 * time.Minute)
 	type wsRead struct {
 		msg []byte
 		err error
 	}
-	readCh := make(chan wsRead, 1)
+	readCh := make(chan wsRead, 8)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
+		defer close(readCh)
 		for {
 			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 			_, msg, err := conn.ReadMessage()
-			readCh <- wsRead{msg: msg, err: err}
+			select {
+			case readCh <- wsRead{msg: msg, err: err}:
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
 			if err != nil {
 				return
 			}
@@ -381,14 +656,44 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		select {
 		case <-ctx.Done():
 			returnConn = false
-			return Result{}, ctx.Err()
-		case read = <-readCh:
+			_ = conn.Close()
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
+			}
+			return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", cause: ctx.Err()}
+		case r, ok := <-readCh:
+			if !ok {
+				if ctx.Err() != nil {
+					returnConn = false
+					if errors.Is(ctx.Err(), context.Canceled) {
+						return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: ctx.Err()}
+					}
+					return Result{}, &DialError{Status: 0, Kind: "WS_READ_TIMEOUT", cause: ctx.Err()}
+				}
+				returnConn = false
+				return Result{}, fmt.Errorf("ws read before completion: %w", io.ErrUnexpectedEOF)
+			}
+			read = r
 		}
 		if read.err != nil {
 			returnConn = false
-			// Never convert a timeout or dropped WebSocket into a successful
-			// partial response. A response is complete only after SignalR type 3.
-			return Result{}, fmt.Errorf("ws read before completion: %w", read.err)
+			if errors.Is(read.err, context.Canceled) {
+				return Result{}, &DialError{Status: 0, Kind: "CLIENT_CANCELED", cause: fmt.Errorf("ws read before completion: %w", read.err)}
+			}
+			kind := "WS_READ_TIMEOUT"
+			if strings.Contains(strings.ToLower(read.err.Error()), "timeout") || errors.Is(read.err, context.DeadlineExceeded) {
+				kind = "WS_READ_TIMEOUT"
+			} else {
+				kind = classifyTransportError(read.err)
+				if kind == "TCP" {
+					kind = "WS_READ_TIMEOUT"
+				}
+			}
+			return Result{}, &DialError{Status: 0, Kind: kind, cause: fmt.Errorf("ws read before completion: %w", read.err)}
+		}
+		if !firstServiceResponse {
+			firstServiceResponse = true
+			ts.FirstServiceResponseReceived = time.Now().UTC().Format(time.RFC3339Nano)
 		}
 		for _, part := range strings.Split(string(read.msg), rs) {
 			part = strings.TrimSpace(part)
@@ -422,11 +727,15 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					}
 					msgs, _ := arg["messages"].([]any)
 					if onEvent != nil {
+						beforeTools := len(seenStreamTools)
 						for _, ev := range extractToolEvents(arg, seenStreamTools) {
 							if err := onEvent(ev); err != nil {
 								returnConn = false
 								return Result{}, err
 							}
+						}
+						if len(seenStreamTools) > beforeTools {
+							phase = PhaseStreaming
 						}
 					}
 
@@ -454,10 +763,77 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					if thr, ok := arg["throttling"]; ok {
 						throttling = thr
 					}
+					if ctt, ok := arg["conversationTransferToken"].(string); ok && ctt != "" {
+						conversationTransferToken = ctt
+					}
+					if mi, ok := arg["meteringInformation"]; ok && mi != nil {
+						meteringInformation = mi
+					}
+					if srs, ok := arg["suggestedResponses"].([]any); ok {
+						for _, srRaw := range srs {
+							sr, ok := srRaw.(map[string]any)
+							if !ok {
+								continue
+							}
+							suggestions = append(suggestions, parseSuggestedResponse(sr))
+						}
+					}
 					if w, ok := arg["writeAtCursor"].(string); ok && w != "" && !toolFrame {
 						if err := emitSnapshot(w); err != nil {
 							returnConn = false
 							return Result{}, err
+						}
+					}
+					if patches, ok := arg["patches"].([]any); ok {
+						for _, praw := range patches {
+							p, ok := praw.(map[string]any)
+							if !ok {
+								continue
+							}
+							op, _ := p["op"].(string)
+							path, _ := p["path"].(string)
+							value, _ := p["value"]
+							if op != "replace" || path == "" {
+								continue
+							}
+							parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 2)
+							if len(parts) < 2 {
+								continue
+							}
+							field := parts[1]
+							switch field {
+							case "spokenText":
+								if vs, ok := value.(string); ok {
+									spokenText = vs
+								}
+							}
+						}
+					}
+					if refs, ok := arg["references"].(map[string]any); ok && len(refs) > 0 {
+						for k, v := range refs {
+							rm, ok := v.(map[string]any)
+							if !ok {
+								continue
+							}
+							ref := Reference{}
+							if tl, ok := rm["targetLink"].(string); ok {
+								ref.TargetLink = tl
+							}
+							if pdn, ok := rm["providerDisplayName"].(string); ok {
+								ref.ProviderDisplayName = pdn
+							}
+							if t, ok := rm["title"].(string); ok {
+								ref.Title = t
+							}
+							if s, ok := rm["snippet"].(string); ok {
+								ref.Snippet = s
+							}
+							if lud, ok := rm["lastUpdatedDate"].(string); ok {
+								ref.LastUpdatedDate = lud
+							}
+							if ref.TargetLink != "" || ref.Title != "" {
+								references[k] = ref
+							}
 						}
 					}
 					if msgs, ok := arg["messages"].([]any); ok {
@@ -469,6 +845,23 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							author, _ := m["author"].(string)
 							text, _ := m["text"].(string)
 							mt, _ := m["messageType"].(string)
+							if o, ok := m["offense"].(string); ok && o != "" && o != "Unknown" && o != "None" {
+								offense = o
+							}
+							if ss, ok := m["scores"].([]any); ok {
+								for _, sraw := range ss {
+									if sm, ok := sraw.(map[string]any); ok {
+										comp, _ := sm["component"].(string)
+										sc, _ := sm["score"].(float64)
+										if comp != "" {
+											scores = append(scores, Score{Component: comp, Score: sc})
+										}
+									}
+								}
+							}
+							if st, ok := m["spokenText"].(string); ok {
+								spokenText = st
+							}
 							if author == "bot" && mt == "" && text != "" {
 								// ChatHub often sends the first visible text as a full snapshot,
 								// followed by cursor deltas. Emit only the unseen suffix.
@@ -486,16 +879,37 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			if int(t) == 2 {
 				item, _ := obj["item"].(map[string]any)
 				if item != nil {
+					if smid, ok := item["storageMessageId"].(string); ok && smid != "" {
+						storageMessageID = smid
+					}
 					if thr, ok := item["throttling"]; ok {
 						throttling = thr
+					}
+					if sugg, ok := item["suggestedResponses"].([]any); ok && len(sugg) > 0 && len(suggestions) == 0 {
+						for _, s := range sugg {
+							if sm, ok := s.(map[string]any); ok {
+								sr := parseSuggestedResponse(sm)
+								if sr.CommandText != "" || sr.Text != "" {
+									suggestions = append(suggestions, sr)
+								}
+							}
+						}
 					}
 					if res, ok := item["result"].(map[string]any); ok {
 						rawResult, _ = res["value"].(string)
 				if msg, ok := res["message"].(string); ok {
 						final = msg
+						if imageLimitDetected(final) {
+							returnConn = false
+							return Result{}, ErrImageLimit
+						}
 						if rateLimited(final) {
 							returnConn = false
 							return Result{}, ErrRateLimitNotice
+						}
+						if IsContentPolicyBlock(final) {
+							returnConn = false
+							return Result{}, ErrOffensiveContent
 						}
 					}
 					}
@@ -509,13 +923,28 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					returnConn = false
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
 				}
-				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), streamed.Len(), len(events))
-				text := streamed.String()
-				if text == "" {
-					text = final
+				phase = PhaseCompleted
+				ts.LastTokenReceived = time.Now().UTC().Format(time.RFC3339Nano)
+				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d skipped_snapshots=%d", time.Since(payloadSentAt).Milliseconds(), streamed.Len(), len(events), skippedSnapshots)
+				// Guard against streaming a rate-limit notice out as content
+				// before finalizeText delivers a missing tail. The type-2
+				// handler already rejects notice finals, so this only fires
+				// on frame-order anomalies.
+				if rateLimited(final) {
+					returnConn = false
+					return Result{}, ErrRateLimitNotice
+				}
+				text, ferr := finalizeText(streamed.String(), final, skippedSnapshots, emitDelta)
+				if ferr != nil {
+					returnConn = false
+					return Result{}, ferr
 				}
 				if text == "" {
 					text = strings.Join(deltas, "")
+				}
+				if imageLimitDetected(text) {
+					returnConn = false
+					return Result{}, ErrImageLimit
 				}
 				if rateLimited(text) {
 					returnConn = false
@@ -525,18 +954,47 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					returnConn = false
 					return Result{}, ErrEmptyCompletion
 				}
-				return Result{
-					Text:           text,
-					Reasoning:      reasoningBuf.String(),
-					ConversationID: req.ConversationID,
-					SessionID:      req.SessionID,
-					RequestID:      requestID,
-					Throttling:     throttling,
-					RawResult:      rawResult,
-					Events:         events,
-					Normalized:     NormalizeEvents(events),
-					Images:         imageURLs(events),
-				}, nil
+				if offense != "" {
+					returnConn = false
+					return Result{}, ErrOffensiveContent
+				}
+				if IsContentPolicyBlock(text) {
+					returnConn = false
+					return Result{}, ErrOffensiveContent
+				}
+				result := Result{
+					Text:                      text,
+					Reasoning:                 reasoningBuf.String(),
+					ConversationID:            req.ConversationID,
+					SessionID:                 req.SessionID,
+					RequestID:                 requestID,
+					Throttling:                throttling,
+					SuggestedResponses:        suggestions,
+					Offense:                   offense,
+					Scores:                    scores,
+					ConversationTransferToken: conversationTransferToken,
+					MeteringInformation:       meteringInformation,
+					SpokenText:                spokenText,
+					StorageMessageID:          storageMessageID,
+					References:                references,
+					RawResult:                 rawResult,
+					Events:                    events,
+					Normalized:                NormalizeEvents(events),
+					Images:                    imageURLs(events),
+					Timestamps:                ts,
+				}
+				if c.Pool != nil {
+					go func() {
+						warmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+						defer cancel()
+						warmReqID := uuid.NewString()
+						warmSID := uuid.NewString()
+						warmCID := uuid.NewString()
+						warmURL, _ := BuildWSURL(acc, warmSID, warmCID, warmReqID, req.LicenseType, req.Scenario)
+						c.Pool.Warm(warmCtx, acc, warmURL)
+					}()
+				}
+				return result, nil
 			}
 		}
 	}
@@ -548,10 +1006,47 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
 }
 
-func buildWSURL(acc Account, sessionID, conversationID, requestID string) (string, error) {
+// finalizeText reconciles the incrementally streamed text with the
+// authoritative final message carried by the SignalR type-2 result frame.
+//
+// emitSnapshot drops non-prefix rewrites to stay UTF-8 safe, which can leave
+// the streamed buffer incomplete — or, when an early fragment poisoned the
+// prefix check, diverged from the real answer (issue #51). The final message
+// is upstream's source of truth, so:
+//
+//   - final no longer than streamed → keep the streamed text;
+//   - streamed is a proper prefix of final → the stream missed the tail;
+//     emit the missing part so streaming clients also receive the complete
+//     answer, then return final;
+//   - otherwise → the streamed prefix diverged; already-sent deltas cannot
+//     be retracted, but final is returned as the Result text so non-stream
+//     callers and conversation history stay correct.
+func finalizeText(streamedText, final string, skipped int, emit func(string) error) (string, error) {
+	if final == "" || len(final) <= len(streamedText) {
+		if streamedText == "" {
+			return final, nil
+		}
+		return streamedText, nil
+	}
+	if strings.HasPrefix(final, streamedText) {
+		if err := emit(final[len(streamedText):]); err != nil {
+			return "", err
+		}
+		return final, nil
+	}
+	log.Printf("[emitSnapshot] streamed text diverged from final result (streamed=%d final=%d skipped_snapshots=%d); using final", len(streamedText), len(final), skipped)
+	return final, nil
+}
+
+func BuildWSURL(acc Account, sessionID, conversationID, requestID, licenseType, scenario string) (string, error) {
+	return BuildWSURLWithOptions(acc, sessionID, conversationID, requestID, licenseType, scenario, false)
+}
+
+func BuildWSURLWithOptions(acc Account, sessionID, conversationID, requestID, licenseType, scenario string, disableMemory bool) (string, error) {
 	q := url.Values{}
 	q.Set("chatsessionid", requestID)
 	q.Set("clientrequestid", requestID)
+	q.Set("XRoutingParameterSessionKey", requestID)
 	q.Set("X-SessionId", sessionID)
 	q.Set("ConversationId", conversationID)
 	q.Set("access_token", acc.AccessToken)
@@ -560,14 +1055,49 @@ func buildWSURL(acc Account, sessionID, conversationID, requestID string) (strin
 	q.Set("source", `"officeweb"`)
 	q.Set("product", "Office")
 	q.Set("agentHost", "Bizchat.FullScreen")
-	q.Set("licenseType", "Starter")
+	if licenseType != "" {
+		q.Set("licenseType", licenseType)
+	} else {
+		q.Set("licenseType", "Starter")
+	}
 	q.Set("agent", "web")
-	q.Set("scenario", "OfficeWebIncludedCopilot")
+	if scenario != "" {
+		q.Set("scenario", scenario)
+	} else {
+		q.Set("scenario", "OfficeWebIncludedCopilot")
+	}
+	if disableMemory {
+		q.Set("disableMemory", "1")
+	}
+	q.Set("isEdu", "false")
 
 	// url.Values encodes quotes; probe used safe='",' so keep quotes unescaped-ish.
 	// Gorilla/url will encode " to %22 which MS accepts.
 	u := fmt.Sprintf("%s/%s@%s?%s", wsBase, acc.OID, acc.TID, q.Encode())
 	return u, nil
+}
+
+// downloadClient returns an HTTP client used only for fetching remote image
+// attachments. It reuses the shared transport (so proxy settings apply) but
+// installs a redirect guard: validateRemoteDownloadURL only inspects the
+// initial URL, so without re-validation a server could 302 an approved public
+// URL to http://169.254.169.254/ or an internal host and defeat the SSRF
+// check. Here every redirect target is re-validated and hops are capped.
+func (c *Client) downloadClient() *http.Client {
+	base := c.HTTPClient
+	if base == nil {
+		base = http.DefaultClient
+	}
+	return &http.Client{
+		Transport: base.Transport,
+		Timeout:   base.Timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("attachment download: too many redirects")
+			}
+			return validateRemoteDownloadURL(req.URL.String())
+		},
+	}
 }
 
 func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversationID string, attachments []Attachment) error {
@@ -591,7 +1121,7 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 			if err != nil {
 				return fmt.Errorf("attachment %d: create request: %w", i, err)
 			}
-			resp, err := c.HTTPClient.Do(req)
+			resp, err := c.downloadClient().Do(req)
 			if err != nil {
 				return fmt.Errorf("attachment %d: download: %w", i, err)
 			}
@@ -703,29 +1233,56 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 	return nil
 }
 
-func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, mcpServerURL string) string {
-	text = toolProtocolPrompt(text, tools, toolChoice, len(clientPlugins(tools, mcpServerURL)) > 0)
+func chatPayload(req Request, requestID string, firstTurn bool) string {
+	locale := req.Locale
+	if locale == "" {
+		locale = "en-us"
+	}
+	market := req.Market
+	if market == "" {
+		market = "en-us"
+	}
+	tz := req.TimeZone
+	if tz == "" {
+		tz = "UTC"
+	}
+	tzOffset := req.TimeZoneOffset
+	deviceOS := req.DeviceOS
+	if deviceOS == "" {
+		deviceOS = "Windows"
+	}
+	text := toolProtocolPrompt(req.Text, req.Tools, req.ToolChoice, len(clientPlugins(req.Tools, req.MCPServerURL)) > 0)
+	federatedConns := req.ConnectedFederatedIDs
+	if len(federatedConns) == 0 {
+		federatedConns = []string{"dummyId"}
+	}
+	fcAny := make([]any, len(federatedConns))
+	for i, id := range federatedConns {
+		fcAny[i] = id
+	}
 	message := map[string]any{
 		"author":                "user",
-		"attachments":           attachments,
+		"attachments":           req.Attachments,
 		"inputMethod":           "Keyboard",
 		"text":                  text,
 		"entityAnnotationTypes": []string{"People", "File", "Event", "Email", "TeamsMessage"},
 		"requestId":             requestID,
 		"locationInfo": map[string]any{
-			"timeZoneOffset": 8,
-			"timeZone":       "Asia/Shanghai",
+			"timeZoneOffset": tzOffset,
+			"timeZone":       tz,
 		},
-		"locale":            "zh-cn",
+		"locale":            locale,
+		"market":            market,
 		"messageType":       "Chat",
 		"experienceType":    "Default",
 		"adaptiveCards":     []any{},
 		"clientPreferences": map[string]any{},
+		"connectedFederatedConnections": fcAny,
 	}
 	// The browser does not send an OpenAI attachments array to ChatHub. It
 	// sends a file annotation after the file has been uploaded by Office.
-	annotations := make([]any, 0, len(attachments))
-	for _, a := range attachments {
+	annotations := make([]any, 0, len(req.Attachments))
+	for _, a := range req.Attachments {
 		if a.Type != "image" || a.DocID == "" {
 			continue
 		}
@@ -750,12 +1307,12 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 	}
 	if len(annotations) > 0 {
 		message["messageAnnotations"] = annotations
-		message["connectedFederatedConnections"] = []string{"dummyId"}
+		message["connectedFederatedConnections"] = fcAny
 	}
 	// Restore the old gateway's multimodal injection path. The historical
 	// implementation merged imageUrl/imageBase64 directly into message rather
 	// than relying solely on the newer attachments array.
-	for _, a := range attachments {
+	for _, a := range req.Attachments {
 		if a.Type != "image" || a.URL == "" {
 			continue
 		}
@@ -773,49 +1330,113 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 		"update_textdoc_response_after_streaming",
 		"deepleo_networking_timeout_10minutes_canmore",
 		"cwc_flux_image",
+		"cwc_code_interpreter",
+		"cwc_code_interpreter_amsfix",
 		"cwcfluxgptv",
 		"flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
 		"gptvnorm2048",
+		"cwc_code_interpreter_citation_fix",
+		"code_interpreter_interactive_charts",
+		"cwc_code_interpreter_interactive_charts_inline_image",
+		"code_interpreter_matplotlib_patching",
 		"cwc_fileupload_odb",
-		"update_memory_plugin",
-		"add_custom_instructions",
 		"cwc_flux_v3",
 		"flux_v3_progress_messages",
 		"enable_batch_token_processing",
 		"enable_gg_gpt",
+		"flux_v3_references",
+		"flux_v3_references_entities",
+		"flux_v3_references_ci",
+		"add_filestore_filetype",
+		"cwc_code_interpreter_citation_sourceannotations",
+		"cdxcwc_code_interpreter_hallucinated_url_filter",
+		"flux_v3_image_gen_enable_dimensions",
+		"flux_v3_image_gen_enable_non_watermarked_storage",
+		"flux_v3_image_gen_enable_icon_dimensions",
+		"flux_v3_image_gen_enable_system_text_with_params",
+		"flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
+		"flux_v3_image_gen_enable_story",
+		"rich_responses",
+	}
+	if req.FeatureFlags.MemoryV2 {
+		optionsSets = append(optionsSets, "update_memory_plugin", "add_custom_instructions")
+	}
+	if req.FeatureFlags.DeepWork {
+		optionsSets = append(optionsSets, "enable_deep_work")
+	}
+	if req.FeatureFlags.ComputerUse {
+		optionsSets = append(optionsSets, "enable_computer_use")
+	}
+	if req.FeatureFlags.RealtimeVoice {
+		optionsSets = append(optionsSets, "enable_realtime_voice")
+	}
+	if req.FeatureFlags.SystemPromptOverride {
+		optionsSets = append(optionsSets, "enable_system_prompt_override")
+	}
+	if req.FeatureFlags.DesignerImageGen4o {
+		optionsSets = append(optionsSets, "enable_designer_image_gen_4o")
+	}
+	if req.FeatureFlags.CodeCanvas {
+		optionsSets = append(optionsSets, "feature.enableCodeCanvas")
+	}
+	if req.FeatureFlags.SydneyReconnect {
+		optionsSets = append(optionsSets, "enable_sydney_reconnect")
 	}
 	chat := map[string]any{
 		"arguments": []any{
 			map[string]any{
 				"source":              "officeweb",
 				"clientCorrelationId": uuid.NewString(),
-				"sessionId":           sessionID,
+				"sessionId":           req.SessionID,
 				"optionsSets":         optionsSets,
 				"options":             map[string]any{},
 				"allowedMessageTypes": []string{
-					"Chat", "Suggestion", "Disengaged", "Progress", "EndOfRequest", "InternalLoaderMessage",
+					"Chat", "Suggestion", "InternalSearchQuery", "Disengaged",
+					"InternalLoaderMessage", "Progress", "GeneratedCode",
+					"RenderCardRequest", "AdsQuery", "SemanticSerp",
+					"GenerateContentQuery", "GenerateGraphicArt", "SearchQuery",
+					"ConfirmationCard", "AuthError", "DeveloperLogs",
+					"TriggerPlugin", "HintInvocation", "MemoryUpdate",
+					"EndOfRequest", "TriggerConfirmation", "ResumeInvokeAction",
+					"ResumeUserInputRequest", "TriggerUserInputRequest",
+					"EscapeHatch", "TriggerPluginAuth", "ResumePluginAuth",
+					"SideBySide", "ReferencesListComplete", "SwitchRespondingEndpoint",
 				},
 				"sliceIds":          []any{},
 				"threadLevelGptId":  map[string]any{},
-				"conversationId":    conversationID,
+				"conversationId":    req.ConversationID,
 				"traceId":           uuid.NewString(),
 				"isStartOfSession":  firstTurn,
 				"productThreadType": "Office",
 				"clientInfo": map[string]any{
-					"clientPlatform": "mcmcopilot-web",
-					"clientAppName":  "Office",
+					"clientPlatform":        "mcmcopilot-web",
+					"clientAppName":         "Office",
+					"clientEntrypoint":      "mcmcopilot-officeweb",
+					"clientSessionId":       req.SessionID,
+					"ProductCategory":       "Chat",
+					"clientAppType":         "Web",
+					"productEntryPoint":     "ChatPanel",
+					"deviceOS":              deviceOS,
+					"deviceType":            "Desktop",
+					"clientPlatformVersion": "10",
 				},
-				"tone":          tone,
+				"tone":          req.Tone,
 				"streamingMode": "ConciseWithPadding",
 				"message":       message,
 
-				"plugins":    clientPlugins(tools, mcpServerURL),
-				"toolChoice": toolChoice,
+				"plugins":    clientPlugins(req.Tools, req.MCPServerURL),
+				"toolChoice": req.ToolChoice,
 			},
 		},
 		"invocationId": "0",
 		"target":       "chat",
 		"type":         4,
+	}
+	if req.ConversationSignature != "" {
+		chat["arguments"].([]any)[0].(map[string]any)["conversationSignature"] = req.ConversationSignature
+	}
+	if len(req.PreviousMessages) > 0 {
+		chat["arguments"].([]any)[0].(map[string]any)["previousMessages"] = req.PreviousMessages
 	}
 	metrics := map[string]any{
 		"arguments": []any{
@@ -834,4 +1455,55 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 	b1, _ := json.Marshal(chat)
 	b2, _ := json.Marshal(metrics)
 	return string(b1) + rs + string(b2) + rs
+}
+
+func parseSuggestedResponse(m map[string]any) SuggestedResponse {
+	ct, _ := m["commandText"].(string)
+	t, _ := m["text"].(string)
+	sc, _ := m["suggestionCategory"].(string)
+	co, _ := m["contentOrigin"].(string)
+	ht, _ := m["hiddenText"].(string)
+	mid, _ := m["messageId"].(string)
+	author, _ := m["author"].(string)
+	ca, _ := m["createdAt"].(string)
+	mt, _ := m["messageType"].(string)
+	off, _ := m["offense"].(string)
+	return SuggestedResponse{
+		CommandText: ct, Text: t, SuggestionCategory: sc, ContentOrigin: co,
+		HiddenText: ht, MessageID: mid, Author: author, CreatedAt: ca,
+		MessageType: mt, Offense: off,
+	}
+}
+
+var (
+	citeOpen  = string([]rune{0xE200}) + "cite" + string([]rune{0xE202})
+	citeClose = string([]rune{0xE201})
+)
+
+func StripCitationMarkers(text string, refs map[string]Reference) (string, []string) {
+	if !strings.Contains(text, citeOpen) {
+		return text, nil
+	}
+	var urls []string
+	var b strings.Builder
+	for {
+		i := strings.Index(text, citeOpen)
+		if i < 0 {
+			b.WriteString(text)
+			break
+		}
+		b.WriteString(text[:i])
+		after := text[i+len(citeOpen):]
+		j := strings.Index(after, citeClose)
+		if j < 0 {
+			b.WriteString(text[i:])
+			break
+		}
+		refID := after[:j]
+		text = after[j+len(citeClose):]
+		if ref, ok := refs[refID]; ok && ref.TargetLink != "" {
+			urls = append(urls, ref.TargetLink)
+		}
+	}
+	return b.String(), urls
 }
