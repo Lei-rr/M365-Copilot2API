@@ -15,26 +15,32 @@ import (
 type ErrorCategory string
 
 const (
-	CategoryQuota429          ErrorCategory = "QUOTA_429"
-	CategoryOverload503       ErrorCategory = "OVERLOAD_503"
-	CategoryAuthExpired401    ErrorCategory = "AUTH_EXPIRED_401"
-	CategoryForbidden403      ErrorCategory = "FORBIDDEN_403"
-	CategorySOCKS5            ErrorCategory = "SOCKS5"
-	CategoryDNS               ErrorCategory = "DNS"
-	CategoryTCP               ErrorCategory = "TCP"
-	CategoryTLS               ErrorCategory = "TLS"
-	CategoryWSHandshake       ErrorCategory = "WS_HANDSHAKE"
-	CategoryWSReadTimeout     ErrorCategory = "WS_READ_TIMEOUT"
+	CategoryQuota429           ErrorCategory = "QUOTA_429"
+	CategoryOverload503        ErrorCategory = "OVERLOAD_503"
+	CategoryAuthExpired401     ErrorCategory = "AUTH_EXPIRED_401"
+	CategoryForbidden403       ErrorCategory = "FORBIDDEN_403"
+	CategoryRetryable422       ErrorCategory = "RETRYABLE_422"
+	CategoryUserBanned         ErrorCategory = "USER_BANNED"
+	CategoryUserThrottled      ErrorCategory = "USER_THROTTLED"
+	CategoryInsufficientTokens ErrorCategory = "INSUFFICIENT_TOKENS"
+	CategoryDesignerDisabled   ErrorCategory = "DESIGNER_DISABLED"
+	CategorySOCKS5             ErrorCategory = "SOCKS5"
+	CategoryDNS                ErrorCategory = "DNS"
+	CategoryTCP                ErrorCategory = "TCP"
+	CategoryTLS                ErrorCategory = "TLS"
+	CategoryWSHandshake        ErrorCategory = "WS_HANDSHAKE"
+	CategoryWSReadTimeout      ErrorCategory = "WS_READ_TIMEOUT"
 	CategoryUpstreamStructured ErrorCategory = "UPSTREAM_STRUCTURED"
-	CategoryClientCanceled    ErrorCategory = "CLIENT_CANCELED"
-	CategoryGlobalUnavailable ErrorCategory = "GLOBAL_UNAVAILABLE"
-	CategoryUnknown           ErrorCategory = "UNKNOWN"
+	CategoryClientCanceled     ErrorCategory = "CLIENT_CANCELED"
+	CategoryGlobalUnavailable  ErrorCategory = "GLOBAL_UNAVAILABLE"
+	CategoryUnknown            ErrorCategory = "UNKNOWN"
 )
 
 type UpstreamHTTPError struct {
 	Status     int
 	RetryAfter int
 	Body       string
+	ErrorCode  string
 }
 
 func (e *UpstreamHTTPError) Error() string {
@@ -48,7 +54,7 @@ func ClassifyError(err error) ErrorCategory {
 	if errors.Is(err, context.Canceled) {
 		return CategoryClientCanceled
 	}
-	if errors.Is(err, chathub.ErrRateLimitNotice) {
+	if errors.Is(err, chathub.ErrRateLimitNotice) || errors.Is(err, chathub.ErrMeteringThrottled) {
 		return CategoryQuota429
 	}
 	if errors.Is(err, chathub.ErrEmptyCompletion) || errors.Is(err, chathub.ErrOffensiveContent) || errors.Is(err, chathub.ErrImageLimit) {
@@ -56,6 +62,18 @@ func ClassifyError(err error) ErrorCategory {
 	}
 	var httpErr *UpstreamHTTPError
 	if errors.As(err, &httpErr) {
+		if httpErr.ErrorCode != "" {
+			switch httpErr.ErrorCode {
+			case "ErrorUserBanned":
+				return CategoryUserBanned
+			case "ErrorUserThrottled":
+				return CategoryUserThrottled
+			case "InsufficientTokens":
+				return CategoryInsufficientTokens
+			case "ErrorDisallowedAADUser":
+				return CategoryDesignerDisabled
+			}
+		}
 		switch httpErr.Status {
 		case 429:
 			return CategoryQuota429
@@ -65,6 +83,8 @@ func ClassifyError(err error) ErrorCategory {
 			return CategoryAuthExpired401
 		case 403:
 			return CategoryForbidden403
+		case 422:
+			return CategoryRetryable422
 		}
 		if strings.Contains(strings.ToLower(httpErr.Body), "limited") {
 			return CategoryQuota429
@@ -107,6 +127,8 @@ func ClassifyError(err error) ErrorCategory {
 			return CategoryAuthExpired401
 		case 403:
 			return CategoryForbidden403
+		case 422:
+			return CategoryRetryable422
 		}
 		if dialErr.Kind != "" {
 			return ErrorCategory(dialErr.Kind)
@@ -160,7 +182,7 @@ func IsRateLimited(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, chathub.ErrRateLimitNotice) {
+	if errors.Is(err, chathub.ErrRateLimitNotice) || errors.Is(err, chathub.ErrMeteringThrottled) {
 		return true
 	}
 	var httpErr *UpstreamHTTPError
@@ -168,7 +190,8 @@ func IsRateLimited(err error) bool {
 		if httpErr.Status == 429 || httpErr.Status == 503 {
 			return true
 		}
-		if strings.Contains(strings.ToLower(httpErr.Body), "limited") {
+		low := strings.ToLower(httpErr.Body)
+		if strings.Contains(low, "limited") || strings.Contains(low, "图像生成功能没有成功") || strings.Contains(low, "metererror") {
 			return true
 		}
 	}
@@ -242,6 +265,16 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 		return 2 * time.Minute
 	case CategoryForbidden403:
 		return 24 * time.Hour
+	case CategoryUserBanned:
+		return 365 * 24 * time.Hour
+	case CategoryUserThrottled:
+		return 1 * time.Hour
+	case CategoryInsufficientTokens:
+		return 24 * time.Hour
+	case CategoryDesignerDisabled:
+		return 0
+	case CategoryRetryable422:
+		return 5 * time.Second
 	case CategorySOCKS5:
 		return 30 * time.Second
 	case CategoryDNS:
@@ -266,11 +299,11 @@ func CooldownForCategory(cat ErrorCategory, retryAfter int, attempt int) time.Du
 }
 
 type globalCircuitState struct {
-	mu        sync.Mutex
+	mu          sync.Mutex
 	windowStart time.Time
-	total     int
-	failures  int
-	openUntil time.Time
+	total       int
+	failures    int
+	openUntil   time.Time
 }
 
 var globalCircuit = &globalCircuitState{}
@@ -323,7 +356,12 @@ func (g *globalCircuitState) Record(err error) {
 		return
 	}
 	cat := ClassifyError(err)
-	if cat == CategoryClientCanceled || cat == CategoryGlobalUnavailable {
+	switch cat {
+	case CategorySOCKS5, CategoryDNS, CategoryTCP, CategoryTLS, CategoryWSHandshake, CategoryWSReadTimeout:
+		// Only shared transport and infrastructure failures contribute to the
+		// global circuit. Account-, policy-, quota-, and request-specific errors
+		// are handled by per-account health state.
+	default:
 		// Client cancels are not upstream faults. Failures already classified
 		// as GLOBAL_UNAVAILABLE must not re-arm the circuit, otherwise traffic
 		// rejected while the circuit is open keeps renewing openUntil forever
@@ -350,10 +388,10 @@ func (g *globalCircuitState) Record(err error) {
 	g.mu.Unlock()
 }
 
-func GlobalCircuitIsOpen() bool { return globalCircuit.IsOpen() }
-func GlobalCircuitState() string { return globalCircuit.State() }
+func GlobalCircuitIsOpen() bool         { return globalCircuit.IsOpen() }
+func GlobalCircuitState() string        { return globalCircuit.State() }
 func GlobalCircuitOpenUntil() time.Time { return globalCircuit.OpenUntil() }
-func GlobalCircuitRecord(err error) { globalCircuit.Record(err) }
+func GlobalCircuitRecord(err error)     { globalCircuit.Record(err) }
 func ResetGlobalCircuit() {
 	globalCircuit.mu.Lock()
 	globalCircuit.windowStart = time.Time{}
@@ -364,30 +402,40 @@ func ResetGlobalCircuit() {
 }
 
 type accountHealth struct {
-	mu              sync.Mutex
-	cooldown        map[string]time.Time
-	authFail        map[string]bool
-	limited         map[string]bool
-	calls           map[string]uint64
-	imageLimited    map[string]bool
-	imageLimitUntil map[string]time.Time
-	lastThrottling  map[string]any
-	authFailReason  map[string]string
-	quotaAttempts   map[string]int
+	mu                     sync.Mutex
+	cooldown               map[string]time.Time
+	authFail               map[string]bool
+	limited                map[string]bool
+	calls                  map[string]uint64
+	imageLimited           map[string]bool
+	imageLimitUntil        map[string]time.Time
+	imageGenCooldownUntil  map[string]time.Time
+	imageGenSystemCooldown map[string]time.Time
+	lastThrottling         map[string]any
+	lastMeterError         map[string]string
+	lastMeterAccess        map[string]bool
+	remainingAllowance     map[string]map[string]int
+	authFailReason         map[string]string
+	quotaAttempts          map[string]int
 }
 
 func newAccountHealth() *accountHealth {
 	ResetGlobalCircuit()
 	return &accountHealth{
-		cooldown:        map[string]time.Time{},
-		authFail:        map[string]bool{},
-		limited:         map[string]bool{},
-		calls:           map[string]uint64{},
-		imageLimited:    map[string]bool{},
-		imageLimitUntil: map[string]time.Time{},
-		lastThrottling:  map[string]any{},
-		authFailReason:  map[string]string{},
-		quotaAttempts:   map[string]int{},
+		cooldown:               map[string]time.Time{},
+		authFail:               map[string]bool{},
+		limited:                map[string]bool{},
+		calls:                  map[string]uint64{},
+		imageLimited:           map[string]bool{},
+		imageLimitUntil:        map[string]time.Time{},
+		imageGenCooldownUntil:  map[string]time.Time{},
+		imageGenSystemCooldown: map[string]time.Time{},
+		lastThrottling:         map[string]any{},
+		lastMeterError:         map[string]string{},
+		lastMeterAccess:        map[string]bool{},
+		remainingAllowance:     map[string]map[string]int{},
+		authFailReason:         map[string]string{},
+		quotaAttempts:          map[string]int{},
 	}
 }
 
@@ -406,6 +454,12 @@ func (h *accountHealth) cleanupExpiredCooldownLocked(accountID string) {
 		delete(h.calls, accountID)
 	}
 	delete(h.quotaAttempts, accountID)
+	if t, ok := h.imageGenCooldownUntil[accountID]; ok && time.Now().After(t) {
+		delete(h.imageGenCooldownUntil, accountID)
+	}
+	if t, ok := h.imageGenSystemCooldown[accountID]; ok && time.Now().After(t) {
+		delete(h.imageGenSystemCooldown, accountID)
+	}
 }
 
 func (h *accountHealth) MarkCall(accountID string) {
@@ -466,13 +520,93 @@ func (h *accountHealth) ImageLimited(accountID string) bool {
 	return h.imageLimited[accountID]
 }
 
+func (h *accountHealth) MarkImageGenTokensThrottled(accountID string) {
+	if h == nil || accountID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now().UTC()
+	tomorrow := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+	h.imageGenCooldownUntil[accountID] = tomorrow
+}
+
+func (h *accountHealth) MarkImageGenSystemThrottled(accountID string) {
+	if h == nil || accountID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.imageGenSystemCooldown[accountID] = time.Now().Add(30 * time.Minute)
+}
+
+func (h *accountHealth) ImageGenAvailable(accountID string) bool {
+	if h == nil {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if t, ok := h.imageGenCooldownUntil[accountID]; ok && time.Now().Before(t) {
+		return false
+	}
+	if t, ok := h.imageGenSystemCooldown[accountID]; ok && time.Now().Before(t) {
+		return false
+	}
+	return true
+}
+
 func (h *accountHealth) UpdateThrottling(accountID string, data any) {
 	if h == nil || accountID == "" {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.lastThrottling[accountID] = data
+	b, err := json.Marshal(data)
+	if err != nil {
+		return
+	}
+	var copied any
+	if json.Unmarshal(b, &copied) != nil {
+		return
+	}
+	h.lastThrottling[accountID] = copied
+}
+
+func (h *accountHealth) UpdateMetering(accountID, meterError string, hasAccess bool, remaining map[string]int) {
+	if h == nil || accountID == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastMeterError[accountID] = meterError
+	h.lastMeterAccess[accountID] = hasAccess
+	if len(remaining) == 0 {
+		delete(h.remainingAllowance, accountID)
+		return
+	}
+	copyRemaining := make(map[string]int, len(remaining))
+	for capability, allowance := range remaining {
+		copyRemaining[capability] = allowance
+	}
+	h.remainingAllowance[accountID] = copyRemaining
+}
+
+func (h *accountHealth) GetMetering(accountID string) (string, bool, map[string]int) {
+	if h == nil {
+		return "", true, nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	remaining := h.remainingAllowance[accountID]
+	copyRemaining := make(map[string]int, len(remaining))
+	for capability, allowance := range remaining {
+		copyRemaining[capability] = allowance
+	}
+	hasAccess, ok := h.lastMeterAccess[accountID]
+	if !ok {
+		hasAccess = true
+	}
+	return h.lastMeterError[accountID], hasAccess, copyRemaining
 }
 
 func (h *accountHealth) GetThrottling(accountID string) any {
@@ -545,17 +679,23 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		}
 		return
 	case CategoryForbidden403:
+		var httpErr403 *UpstreamHTTPError
+		if errors.As(err, &httpErr403) && httpErr403.ErrorCode == "ErrorDisallowedAADUser" {
+			return
+		}
+		var dialErr403 *chathub.DialError
+		if errors.As(err, &dialErr403) && dialErr403.Kind == "DESIGNER_DISABLED" {
+			return
+		}
 		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, 1))
 		h.authFail[accountID] = true
 		delete(h.limited, accountID)
 		h.authFailReason[accountID] = "403"
-		var httpErr *UpstreamHTTPError
-		if errors.As(err, &httpErr) {
-			h.authFailReason[accountID] = fmt.Sprintf("%d", httpErr.Status)
+		if httpErr403 != nil {
+			h.authFailReason[accountID] = fmt.Sprintf("%d", httpErr403.Status)
 		} else {
-			var dialErr *chathub.DialError
-			if errors.As(err, &dialErr) && dialErr.Status != 0 {
-				h.authFailReason[accountID] = fmt.Sprintf("%d", dialErr.Status)
+			if dialErr403 != nil && dialErr403.Status != 0 {
+				h.authFailReason[accountID] = fmt.Sprintf("%d", dialErr403.Status)
 			}
 		}
 		return
@@ -563,6 +703,11 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
 		h.limited[accountID] = true
+		if errors.Is(err, chathub.ErrMeteringThrottled) && RetryAfterSeconds(err) == 0 {
+			h.quotaAttempts[accountID] = 0
+			h.cooldown[accountID] = time.Now().Add(15 * time.Minute)
+			return
+		}
 		attempt := h.quotaAttempts[accountID] + 1
 		h.quotaAttempts[accountID] = attempt
 		cd := CooldownForCategory(cat, RetryAfterSeconds(err), attempt)
@@ -583,6 +728,27 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 		cd := CooldownForCategory(cat, 0, 1)
 		h.cooldown[accountID] = time.Now().Add(cd)
 		return
+	case CategoryUserBanned:
+		h.authFail[accountID] = true
+		h.authFailReason[accountID] = "banned"
+		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, 1))
+		return
+	case CategoryUserThrottled:
+		h.authFail[accountID] = true
+		h.authFailReason[accountID] = "throttled"
+		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, 1))
+		return
+	case CategoryInsufficientTokens:
+		delete(h.authFail, accountID)
+		delete(h.authFailReason, accountID)
+		h.limited[accountID] = true
+		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, 1))
+		return
+	case CategoryRetryable422:
+		delete(h.authFail, accountID)
+		delete(h.authFailReason, accountID)
+		h.cooldown[accountID] = time.Now().Add(CooldownForCategory(cat, 0, 1))
+		return
 	default:
 		delete(h.authFail, accountID)
 		delete(h.authFailReason, accountID)
@@ -599,6 +765,8 @@ func (h *accountHealth) MarkSuccess(accountID string) {
 	defer h.mu.Unlock()
 	imageLimited := h.imageLimited[accountID]
 	imageLimitUntil := h.imageLimitUntil[accountID]
+	imageGenCooldown := h.imageGenCooldownUntil[accountID]
+	imageGenSysCooldown := h.imageGenSystemCooldown[accountID]
 	delete(h.cooldown, accountID)
 	delete(h.authFail, accountID)
 	delete(h.limited, accountID)
@@ -612,6 +780,16 @@ func (h *accountHealth) MarkSuccess(accountID string) {
 	} else {
 		delete(h.imageLimited, accountID)
 		delete(h.imageLimitUntil, accountID)
+	}
+	if !imageGenCooldown.IsZero() && time.Now().Before(imageGenCooldown) {
+		h.imageGenCooldownUntil[accountID] = imageGenCooldown
+	} else {
+		delete(h.imageGenCooldownUntil, accountID)
+	}
+	if !imageGenSysCooldown.IsZero() && time.Now().Before(imageGenSysCooldown) {
+		h.imageGenSystemCooldown[accountID] = imageGenSysCooldown
+	} else {
+		delete(h.imageGenSystemCooldown, accountID)
 	}
 }
 
@@ -665,10 +843,25 @@ func (h *accountHealth) Snapshot() map[string]map[string]any {
 	for id := range h.lastThrottling {
 		ids[id] = true
 	}
+	for id := range h.lastMeterError {
+		ids[id] = true
+	}
+	for id := range h.lastMeterAccess {
+		ids[id] = true
+	}
+	for id := range h.remainingAllowance {
+		ids[id] = true
+	}
 	for id := range h.calls {
 		ids[id] = true
 	}
 	for id := range h.quotaAttempts {
+		ids[id] = true
+	}
+	for id := range h.imageGenCooldownUntil {
+		ids[id] = true
+	}
+	for id := range h.imageGenSystemCooldown {
 		ids[id] = true
 	}
 	for id := range ids {
@@ -692,8 +885,38 @@ func (h *accountHealth) Snapshot() map[string]map[string]any {
 		if h.imageLimited[id] {
 			m["imageLimited"] = true
 		}
+		if t, ok := h.imageGenCooldownUntil[id]; ok && !t.IsZero() {
+			if time.Now().Before(t) {
+				m["imageGenCooldownUntil"] = t
+			}
+		}
+		if t, ok := h.imageGenSystemCooldown[id]; ok && !t.IsZero() {
+			if time.Now().Before(t) {
+				m["imageGenSystemCooldown"] = t
+			}
+		}
 		if t := h.lastThrottling[id]; t != nil {
-			m["throttling"] = t
+			if b, err := json.Marshal(t); err == nil {
+				var copied any
+				if json.Unmarshal(b, &copied) == nil {
+					m["throttling"] = copied
+				}
+			}
+		}
+		if meterError := h.lastMeterError[id]; meterError != "" {
+			m["meterError"] = meterError
+		}
+		hasAccess, ok := h.lastMeterAccess[id]
+		if !ok {
+			hasAccess = true
+		}
+		m["hasAccess"] = hasAccess
+		if remaining := h.remainingAllowance[id]; len(remaining) > 0 {
+			copied := make(map[string]int, len(remaining))
+			for capability, allowance := range remaining {
+				copied[capability] = allowance
+			}
+			m["remainingAllowance"] = copied
 		}
 		if r := h.authFailReason[id]; r != "" {
 			m["authFailReason"] = r
@@ -721,7 +944,12 @@ func (h *accountHealth) ClearAllCooldowns() {
 	h.calls = map[string]uint64{}
 	h.imageLimited = map[string]bool{}
 	h.imageLimitUntil = map[string]time.Time{}
+	h.imageGenCooldownUntil = map[string]time.Time{}
+	h.imageGenSystemCooldown = map[string]time.Time{}
 	h.lastThrottling = map[string]any{}
+	h.lastMeterError = map[string]string{}
+	h.lastMeterAccess = map[string]bool{}
+	h.remainingAllowance = map[string]map[string]int{}
 	h.authFailReason = map[string]string{}
 	h.quotaAttempts = map[string]int{}
 	ResetGlobalCircuit()
